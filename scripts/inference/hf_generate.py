@@ -123,10 +123,12 @@ def parse_args() -> Namespace:
     parser.add_argument('--device', type=str, default=None)
     parser.add_argument('--device_map', type=str, default=None)
     parser.add_argument('--attn_impl', type=str, default=None)
+    parser.add_argument('--s3_output_dir', type=str, default="s3://mosaicml-68c98fa5-0b21-4c7b-b40b-c4482db8832a/avalaraGPT/item_prediction/inference/")
     return parser.parse_args()
 
+import pandas as pd
 
-def load_prompt_string_from_file(prompt_path_str: str):
+def load_prompts_string_from_file(prompt_path_str: str):
     if not prompt_path_str.startswith('file::'):
         raise ValueError('prompt_path_str must start with "file::".')
     _, prompt_file_path = prompt_path_str.split('file::', maxsplit=1)
@@ -134,9 +136,11 @@ def load_prompt_string_from_file(prompt_path_str: str):
     if not os.path.isfile(prompt_file_path):
         raise FileNotFoundError(
             f'{prompt_file_path=} does not match any existing files.')
-    with open(prompt_file_path, 'r') as f:
-        prompt_string = ''.join(f.readlines())
-    return prompt_string
+    
+    data = pd.read_json(prompt_file_path, lines=True)
+    prompts = list(data["prompt"])
+    
+    return prompts
 
 
 def maybe_synchronize():
@@ -167,8 +171,10 @@ def main(args: Namespace) -> None:
     prompt_strings = []
     for prompt in args.prompts:
         if prompt.startswith('file::'):
-            prompt = load_prompt_string_from_file(prompt)
-        prompt_strings.append(prompt)
+            prompts = load_prompts_string_from_file(prompt)
+            prompt_strings.extend(prompts)
+        else:
+            prompt_strings.append(prompt)
 
     # Grab config first
     print(f'Loading HF Config...')
@@ -237,6 +243,8 @@ def main(args: Namespace) -> None:
 
     done_warmup = False
 
+    s3_output_dir = args.s3_output_dir.rsplit("/")[0] + "/"
+
     for temp, topp, topk, repp, nrnz, seed in itertools.product(
             args.temperature, args.top_p, args.top_k, args.repetition_penalty,
             args.no_repeat_ngram_size, args.seed):
@@ -281,6 +289,10 @@ def main(args: Namespace) -> None:
 
         else:
             batches = [prompt_strings]
+
+        import os
+        output_file = f"output_{temp}_{topp}_{topk}_{repp}_{nrnz}_{seed}.json"
+        generated_responses = []
 
         for batch in batches:
             print(f'\nTokenizing prompts...')
@@ -329,6 +341,7 @@ def main(args: Namespace) -> None:
                 print(delimiter)
                 if len(continuation) > 0:
                     print('\033[92m' + prompt + '\033[0m' + continuation)
+                    generated_responses.append({"prompt": prompt, "response": continuation})
                 else:
                     print('Warning. No non-special output tokens generated.')
                     print(
@@ -339,6 +352,7 @@ def main(args: Namespace) -> None:
                         encoded_gen, skip_special_tokens=False)[idx]
                     print('\033[92m' + 'Prompt:\n' + prompt + '\033[0m')
                     print('Full generation:\n' + full_generation)
+                    generated_responses.append({"prompt": prompt, "response": ""})
 
             print(delimiter)
 
@@ -364,6 +378,9 @@ def main(args: Namespace) -> None:
             )
             print(f'{latency_per_output_token=:.2f}ms/tok')
             print(f'{output_tok_per_sec=:.2f}tok/sec')
+
+        response_df = pd.DataFrame(generated_responses)
+        response_df.to_json(s3_output_dir + output_file, orient="records", lines=True)
 
 
 if __name__ == '__main__':
